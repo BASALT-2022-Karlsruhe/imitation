@@ -4,7 +4,9 @@ Trains a reward model and optionally a policy based on preferences
 between trajectory fragments.
 """
 import abc
+import glob
 import math
+import os
 import pickle
 import random
 import uuid
@@ -21,15 +23,17 @@ from typing import (
     Union,
 )
 
-import cv2
 import numpy as np
 import requests
 import torch as th
+import wandb
 from scipy import special
 from stable_baselines3.common import base_class, type_aliases, utils, vec_env
+from stable_baselines3.common.vec_env import VecMonitor
 from torch import nn
 from torch.utils import data as data_th
 from tqdm.auto import tqdm
+from wandb.integration.sb3 import WandbCallback
 
 from imitation.algorithms import base
 from imitation.data import rollout, types, wrappers
@@ -94,6 +98,151 @@ class TrajectoryGenerator(abc.ABC):
         self._logger = value
 
 
+class FromVideoTrajectoryGenerator(TrajectoryGenerator):
+    def __init__(
+        self,
+        data_path: AnyPath,
+        minerl_agent,
+        seed: Optional[int] = None,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        super().__init__(custom_logger=custom_logger)
+        self.data_path = data_path
+        self.minerl_agent = minerl_agent
+        self.rng = random.Random(seed)
+
+        # register all videos and json files
+        mp4_file_paths = glob.glob(os.path.join(self.data_path, "*.mp4"))
+        unique_ids = set()
+        for mp4_file_path in mp4_file_paths:
+            basename = os.path.basename(mp4_file_path)
+            if basename.endswith(".mp4"):
+                unique_ids.add(basename[:-4])
+            elif basename.endswith(".jsonl"):
+                unique_ids.add(basename[:-5])
+        self.unique_ids = list(unique_ids)
+        # Create tuples of (video_path, json_path) for each unique_id
+        trajectory_tuples = []
+        for unique_id in self.unique_ids:
+            video_path = os.path.abspath(
+                os.path.join(self.data_path, unique_id + ".mp4"),
+            )
+            json_path = os.path.abspath(
+                os.path.join(self.data_path, unique_id + ".jsonl"),
+            )
+            trajectory_tuples.append((video_path, json_path))
+        self.trajectory_tuples = trajectory_tuples
+
+    def __len__(self):
+        return len(self.unique_ids)
+
+    def sample(self, steps: int) -> Sequence[TrajectoryWithRew]:
+        video_path, json_path = self.rng.choice(self.trajectory_tuples)
+        num_steps = util.get_num_lines(json_path)
+        from_step = self.rng.randint(0, num_steps - steps)
+        to_step = from_step + steps
+        return util.load_trajectory(
+            video_path, json_path, from_step, to_step, self.minerl_agent
+        )
+
+    def sample_specific(
+        self, unique_id: str, from_step: int, to_step: int
+    ) -> Sequence[TrajectoryWithRew]:
+        video_path, json_path = self.trajectory_tuples[self.unique_ids.index(unique_id)]
+        return util.load_trajectory(
+            video_path, json_path, from_step, to_step, self.minerl_agent
+        )
+
+    def select_sample(self, steps: int) -> Tuple[str, int, int]:
+        traj_idx = self.rng.randint(0, len(self.unique_ids) - 1)
+        unique_id = self.unique_ids[traj_idx]
+        _, json_path = self.trajectory_tuples[traj_idx]
+        num_steps = util.get_num_lines(json_path)
+        if num_steps <= steps:
+            raise ValueError(
+                f"Trajectory {unique_id} is shorter than requested number of steps: {steps}"
+            )
+        from_step = self.rng.randint(0, num_steps - steps)
+        to_step = from_step + steps
+        return unique_id, from_step, to_step, num_steps
+
+
+class AutoPreferenceDataset(th.utils.data.Dataset):
+    """A PyTorch Dataset for loading preference comparisons on the fly.
+
+    Each item is a tuple consisting of two trajectory fragments
+    and a probability that fragment 1 is preferred over fragment 2.
+
+    This dataset is generating trajectory fragments from two sources
+    one of which is always preferred.
+    """
+
+    def __init__(
+        self,
+        first_source: TrajectoryGenerator,
+        second_source: TrajectoryGenerator,
+        fragment_length: int,
+        first_preferred: Optional[bool] = True,
+        later_fragments_preferred: Optional[bool] = False,
+        seed: Optional[int] = None,
+    ):
+        """Builds an empty AutoPreferenceDataset"""
+        self.first_source = first_source
+        self.second_source = second_source
+        self.fragment_length = fragment_length
+        self.first_preferred = first_preferred
+        self.later_fragments_preferred = later_fragments_preferred
+        self.seed = seed
+
+        self.fragments1: List[Tuple[str, int, int, int]] = []
+        self.fragments2: List[Tuple[str, int, int, int]] = []
+
+    def push(self, num_samples: int = 1):
+        """Add more samples to the dataset"""
+        for _ in range(num_samples):
+            try:
+                fragment1 = self.first_source.select_sample(self.fragment_length)
+            except ValueError as e:
+                print(f"Failed to sample from {self.first_source.data_path}: {str(e)}")
+            try:
+                fragment2 = self.second_source.select_sample(self.fragment_length)
+            except ValueError as e:
+                print(f"Failed to sample from {self.second_source.data_path}: {str(e)}")
+            self.fragments1.append(fragment1)
+            self.fragments2.append(fragment2)
+
+    def __getitem__(self, i) -> Tuple[TrajectoryWithRewPair, float]:
+        try:
+            first_traj = self.first_source.sample_specific(*self.fragments1[i][:-1])
+            second_traj = self.second_source.sample_specific(*self.fragments2[i][:-1])
+        except ValueError:
+            return None
+        if self.later_fragments_preferred:
+            _, from_step, to_step, num_steps = (
+                self.fragments1[i] if self.first_preferred else self.fragments2[i]
+            )
+            # TODO allow custom schedule
+            # increase probability of preference towards end of trajectory
+            pref = 0.5 * (1 + math.sqrt(to_step / num_steps))
+            pref = pref if self.first_preferred else 1 - pref
+        else:
+            pref = 1.0 if self.first_preferred else 0.0
+        return (first_traj, second_traj), pref
+
+    def __len__(self) -> int:
+        assert len(self.fragments1) == len(self.fragments2)
+        return len(self.fragments1)
+
+    def save(self, path: AnyPath) -> None:
+        with open(path, "wb") as file:
+            pickle.dump(self, file)
+
+    @staticmethod
+    def load(path: AnyPath) -> "AutoPreferenceDataset":
+        with open(path, "rb") as file:
+            return pickle.load(file)
+
+
 class TrajectoryDataset(TrajectoryGenerator):
     """A fixed dataset of trajectories."""
 
@@ -119,6 +268,190 @@ class TrajectoryDataset(TrajectoryGenerator):
         trajectories = list(self._trajectories)
         self.rng.shuffle(trajectories)
         return _get_trajectories(trajectories, steps)
+
+
+class MineRLAgentTrainer(TrajectoryGenerator):
+    """Wrapper for training an SB3 algorithm on an arbitrary reward function."""
+
+    def __init__(
+        self,
+        algorithm: base_class.BaseAlgorithm,
+        reward_fn: Union[reward_function.RewardFn, reward_nets.RewardNet],
+        venv: vec_env.VecEnv,
+        exploration_frac: float = 0.0,
+        switch_prob: float = 0.5,
+        random_prob: float = 0.5,
+        seed: Optional[int] = None,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        """Initialize the agent trainer.
+
+        Args:
+            algorithm: the stable-baselines algorithm to use for training.
+            reward_fn: either a RewardFn or a RewardNet instance that will supply
+                the rewards used for training the agent.
+            venv: vectorized environment to train in.
+            exploration_frac: fraction of the trajectories that will be generated
+                partially randomly rather than only by the agent when sampling.
+            switch_prob: the probability of switching the current policy at each
+                step for the exploratory samples.
+            random_prob: the probability of picking the random policy when switching
+                during exploration.
+            seed: random seed for exploratory trajectories.
+            custom_logger: Where to log to; if None (default), creates a new logger.
+        """
+        self.algorithm = algorithm
+        # NOTE: this has to come after setting self.algorithm because super().__init__
+        # will set self.logger, which also sets the logger for the algorithm
+        super().__init__(custom_logger)
+        if isinstance(reward_fn, reward_nets.RewardNet):
+            # utils.check_for_correct_spaces(
+            #    venv,
+            #    reward_fn.observation_space,
+            #    reward_fn.action_space,
+            # )
+            reward_fn = reward_fn.predict_processed
+        self.reward_fn = reward_fn
+        self.exploration_frac = exploration_frac
+
+        # The BufferingWrapper records all trajectories, so we can return
+        # them after training. This should come first (before the wrapper that
+        # changes the reward function), so that we return the original environment
+        # rewards.
+        # When applying BufferingWrapper and RewardVecEnvWrapper, we should use `venv`
+        # instead of `algorithm.get_env()` because SB3 may apply some wrappers to
+        # `algorithm`'s env under the hood. In particular, in image-based environments,
+        # SB3 may move the image-channel dimension in the observation space, making
+        # `algorithm.get_env()` not match with `reward_fn`.
+        self.buffering_wrapper = wrappers.MineRLBufferingWrapper(venv)
+        self.venv = self.reward_venv_wrapper = reward_wrapper.MineRLRewardVecEnvWrapper(
+            self.buffering_wrapper,
+            reward_fn=self.reward_fn,
+        )
+        self.venv = VecMonitor(self.venv)
+
+        self.log_callback = [self.reward_venv_wrapper.make_log_callback()]
+        if wandb.run is not None:
+            self.log_callback.append(WandbCallback())
+
+        self.algorithm.set_env(self.venv)
+        # Unlike with BufferingWrapper, we should use `algorithm.get_env()` instead
+        # of `venv` when interacting with `algorithm`.
+        policy_callable = rollout._policy_to_callable(
+            self.algorithm,
+            self.algorithm.get_env(),
+            # By setting deterministic_policy to False, we ensure that the rollouts
+            # are collected from a deterministic policy only if self.algorithm is
+            # deterministic. If self.algorithm is stochastic, then policy_callable
+            # will also be stochastic.
+            deterministic_policy=False,
+        )
+        self.exploration_wrapper = exploration_wrapper.ExplorationWrapper(
+            policy_callable=policy_callable,
+            venv=self.algorithm.get_env(),
+            random_prob=random_prob,
+            switch_prob=switch_prob,
+            seed=seed,
+        )
+
+    def train(self, steps: int, **kwargs) -> None:
+        """Train the agent using the reward function specified during instantiation.
+
+        Args:
+            steps: number of environment timesteps to train for
+            **kwargs: other keyword arguments to pass to BaseAlgorithm.train()
+
+        Raises:
+            RuntimeError: Transitions left in `self.buffering_wrapper`; call
+                `self.sample` first to clear them.
+        """
+        n_transitions = self.buffering_wrapper.n_transitions
+        if n_transitions:
+            raise RuntimeError(
+                f"There are {n_transitions} transitions left in the buffer. "
+                "Call AgentTrainer.sample() first to clear them.",
+            )
+        self.algorithm.learn(
+            total_timesteps=steps,
+            reset_num_timesteps=False,
+            callback=self.log_callback,
+            **kwargs,
+        )
+
+    def sample(self, steps: int) -> Sequence[types.TrajectoryWithRew]:
+        agent_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
+        # We typically have more trajectories than are needed.
+        # In that case, we use the final trajectories because
+        # they are the ones with the most relevant version of
+        # the agent.
+        # The easiest way to do this will be to first invert the
+        # list and then later just take the first trajectories:
+        agent_trajs = agent_trajs[::-1]
+        avail_steps = sum(len(traj) for traj in agent_trajs)
+
+        exploration_steps = int(self.exploration_frac * steps)
+        if self.exploration_frac > 0 and exploration_steps == 0:
+            self.logger.warn(
+                "No exploration steps included: exploration_frac = "
+                f"{self.exploration_frac} > 0 but steps={steps} is too small.",
+            )
+        agent_steps = steps - exploration_steps
+
+        if avail_steps < agent_steps:
+            self.logger.log(
+                f"Requested {agent_steps} transitions but only {avail_steps} in buffer."
+                f" Sampling {agent_steps - avail_steps} additional transitions.",
+            )
+            sample_until = rollout.make_sample_until(
+                min_timesteps=agent_steps - avail_steps,
+                min_episodes=None,
+            )
+            # Important note: we don't want to use the trajectories returned
+            # here because 1) they might miss initial timesteps taken by the RL agent
+            # and 2) their rewards are the ones provided by the reward model!
+            # Instead, we collect the trajectories using the BufferingWrapper.
+            rollout.generate_trajectories_via_bufferingwrapper(
+                self.algorithm,
+                self.algorithm.get_env(),
+                sample_until=sample_until,
+                # By setting deterministic_policy to False, we ensure that the rollouts
+                # are collected from a deterministic policy only if self.algorithm is
+                # deterministic. If self.algorithm is stochastic, then policy_callable
+                # will also be stochastic.
+                deterministic_policy=False,
+            )
+            additional_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
+            agent_trajs = list(agent_trajs) + list(additional_trajs)
+
+        agent_trajs = _get_trajectories(agent_trajs, agent_steps)
+
+        exploration_trajs = []
+        if exploration_steps > 0:
+            self.logger.log(f"Sampling {exploration_steps} exploratory transitions.")
+            sample_until = rollout.make_sample_until(
+                min_timesteps=exploration_steps,
+                min_episodes=None,
+            )
+            rollout.generate_trajectories_via_bufferingwrapper(
+                policy=self.exploration_wrapper,
+                venv=self.algorithm.get_env(),
+                sample_until=sample_until,
+                # buffering_wrapper collects rollouts from a non-deterministic policy
+                # so we do that here as well for consistency.
+                deterministic_policy=False,
+            )
+            exploration_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
+            exploration_trajs = _get_trajectories(exploration_trajs, exploration_steps)
+        # We call _get_trajectories separately on agent_trajs and exploration_trajs
+        # and then just concatenate. This could mean we return slightly too many
+        # transitions, but it gets the proportion of exploratory and agent transitions
+        # roughly right.
+        return list(agent_trajs) + list(exploration_trajs)
+
+    @TrajectoryGenerator.logger.setter
+    def logger(self, value: imit_logger.HierarchicalLogger):
+        self._logger = value
+        self.algorithm.set_logger(self.logger)
 
 
 class AgentTrainer(TrajectoryGenerator):
@@ -492,7 +825,9 @@ class PreferenceModel(nn.Module):
         if self.discount_factor == 1:
             returns_diff = (rews2 - rews1).sum(axis=0)
         else:
-            discounts = self.discount_factor ** th.arange(len(rews1))
+            discounts = self.discount_factor ** th.arange(len(rews1)).to(
+                self.model.device
+            )
             if self.is_ensemble:
                 discounts = discounts.reshape(-1, 1)
             returns_diff = (discounts * (rews2 - rews1)).sum(axis=0)
@@ -642,6 +977,118 @@ class RandomFragmenter(Fragmenter):
         return list(zip(iterator, iterator))
 
 
+class MineRLFragmenter(Fragmenter):
+    """Sample fragments of trajectories from MineRL envs
+    Never query a comparison between fragments of the same trajcetories.
+    """
+
+    def __init__(
+        self,
+        seed: Optional[float] = None,
+        warning_threshold: int = 10,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        """Initialize the fragmenter.
+
+        Args:
+            seed: an optional seed for the internal RNG
+            warning_threshold: give a warning if the number of available
+                transitions is less than this many times the number of
+                required samples. Set to 0 to disable this warning.
+            custom_logger: Where to log to; if None (default), creates a new logger.
+        """
+        super().__init__(custom_logger)
+        self.rng = random.Random(seed)
+        self.warning_threshold = warning_threshold
+
+    def __call__(
+        self,
+        trajectories: Sequence[TrajectoryWithRew],
+        fragment_length: int,
+        num_pairs: int,
+    ) -> Sequence[TrajectoryWithRewPair]:
+        fragments1: List[TrajectoryWithRew] = []
+        fragments2: List[TrajectoryWithRew] = []
+
+        prev_num_trajectories = len(trajectories)
+        if prev_num_trajectories < 2:
+            raise ValueError("Not enough trajectories to fragment.")
+
+        # filter out all trajectories that are too short
+        trajectories = [traj for traj in trajectories if len(traj) >= fragment_length]
+        if len(trajectories) == 0:
+            raise ValueError(
+                "No trajectories are long enough for the desired fragment length "
+                f"of {fragment_length}.",
+            )
+        num_discarded = prev_num_trajectories - len(trajectories)
+        if num_discarded:
+            self.logger.log(
+                f"Discarded {num_discarded} out of {prev_num_trajectories} "
+                "trajectories because they are shorter than the desired length "
+                f"of {fragment_length}.",
+            )
+
+        weights = [len(traj) for traj in trajectories]
+
+        # number of transitions that will be contained in the fragments
+        num_transitions = 2 * num_pairs * fragment_length
+        if sum(weights) < num_transitions:
+            self.logger.warn(
+                "Fewer transitions available than needed for desired number "
+                "of fragment pairs. Some transitions will appear multiple times.",
+            )
+        elif (
+            self.warning_threshold
+            and sum(weights) < self.warning_threshold * num_transitions
+        ):
+            # If the number of available transitions is not much larger
+            # than the number of requires ones, we already give a warning.
+            # But only if self.warning_threshold is non-zero.
+            self.logger.warn(
+                f"Samples will contain {num_transitions} transitions in total "
+                f"and only {sum(weights)} are available. "
+                f"Because we sample with replacement, a significant number "
+                "of transitions are likely to appear multiple times.",
+            )
+
+        # we need two fragments for each comparison
+        for _ in range(num_pairs):
+            trajs = util.weighted_sample_without_replacement(
+                trajectories, weights, 2, rng=self.rng
+            )
+            # trajs = self.rng.sample(trajectories, weights, k=2)
+            n1 = len(trajs[0])
+            n2 = len(trajs[1])
+            start1 = n1 - fragment_length
+            start2 = n2 - fragment_length
+            end1 = n1
+            end2 = n2
+            terminal1 = trajs[0].terminal
+            terminal2 = trajs[1].terminal
+            fragment1 = TrajectoryWithRew(
+                obs=trajs[0].obs[start1 : end1 + 1],
+                acts=trajs[0].acts[start1:end1],
+                infos=trajs[0].infos[start1:end1]
+                if trajs[0].infos is not None
+                else None,
+                rews=trajs[0].rews[start1:end1],
+                terminal=terminal1,
+            )
+            fragment2 = TrajectoryWithRew(
+                obs=trajs[1].obs[start2 : end2 + 1],
+                acts=trajs[1].acts[start2:end2],
+                infos=trajs[1].infos[start2:end2]
+                if trajs[1].infos is not None
+                else None,
+                rews=trajs[1].rews[start2:end2],
+                terminal=terminal2,
+            )
+            fragments1.append(fragment1)
+            fragments2.append(fragment2)
+        return list(zip(fragments1, fragments2))
+
+
 class ActiveSelectionFragmenter(Fragmenter):
     """Sample fragments of trajectories based on active selection.
 
@@ -781,10 +1228,10 @@ class PreferenceQuerent(abc.ABC):
             fragment_pairs: sequence of pairs of trajectory fragments (the queries)
 
         Returns:
-            None. Preferences are assumed to be answered asynchronously. 
-            
+            None. Preferences are assumed to be answered asynchronously.
+
             Note: When preferences are gathered synchronously, e.g. with the `SyntheticGatherer`,
-            use `DummyPreferenceQuerent`.  
+            use `DummyPreferenceQuerent`.
         """  # noqa: DAR202
 
 
@@ -815,8 +1262,9 @@ class PreferenceGatherer(abc.ABC):
         self.logger = custom_logger or imit_logger.configure()
 
     @abc.abstractmethod
-    def __call__(self, fragment_pairs: Sequence[TrajectoryPair]) -> \
-            Tuple[Sequence[TrajectoryPair], np.ndarray]:
+    def __call__(
+        self, fragment_pairs: Sequence[TrajectoryPair]
+    ) -> Tuple[Sequence[TrajectoryPair], np.ndarray]:
         """Gathers the probabilities that fragment 1 is preferred in `fragment_pairs`.
 
         Args:
@@ -874,8 +1322,9 @@ class SyntheticGatherer(PreferenceGatherer):
         self.rng = np.random.default_rng(seed=seed)
         self.threshold = threshold
 
-    def __call__(self, fragment_pairs: Sequence[TrajectoryWithRewPair]) -> \
-            Tuple[Sequence[TrajectoryWithRewPair], np.ndarray]:
+    def __call__(
+        self, fragment_pairs: Sequence[TrajectoryWithRewPair]
+    ) -> Tuple[Sequence[TrajectoryWithRewPair], np.ndarray]:
         """Computes probability fragment 1 is preferred over fragment 2."""
         returns1, returns2 = self._reward_sums(fragment_pairs)
         if self.temperature == 0:
@@ -899,7 +1348,9 @@ class SyntheticGatherer(PreferenceGatherer):
         self.logger.record("entropy", entropy)
 
         if self.sample:
-            return fragment_pairs, self.rng.binomial(n=1, p=model_probs).astype(np.float32)
+            return fragment_pairs, self.rng.binomial(n=1, p=model_probs).astype(
+                np.float32
+            )
         return fragment_pairs, model_probs
 
     def _reward_sums(self, fragment_pairs) -> Tuple[np.ndarray, np.ndarray]:
@@ -916,31 +1367,36 @@ class SyntheticGatherer(PreferenceGatherer):
 
 
 class PrefCollectGatherer(PreferenceGatherer):
-    def __init__(self,
-                 pref_collect_address: str,
-                 video_output_dir: str,
-                 video_fps: str = 20,
-                 custom_logger: Optional[imit_logger.HierarchicalLogger] = None):
+    def __init__(
+        self,
+        pref_collect_address: str,
+        video_output_dir: str,
+        video_fps: str = 20,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
         super().__init__(custom_logger)
         self.query_endpoint = pref_collect_address + "/preferences/query/"
         self.video_output_dir = video_output_dir
         self.frames_per_second = video_fps
         self.pending_queries = {}
 
-    def __call__(self, fragment_pairs: Sequence[TrajectoryPair]) -> \
-            Tuple[Sequence[TrajectoryPair], np.ndarray]:
+        # create video directory
+        os.makedirs(self.video_output_dir, exist_ok=True)
+
+    def __call__(
+        self, fragment_pairs: Sequence[TrajectoryPair]
+    ) -> Tuple[Sequence[TrajectoryPair], np.ndarray]:
 
         new_queries = {str(uuid.uuid4()): query for query in fragment_pairs}
 
         for query_id, query in new_queries.items():
-            self._write_fragment_video(query[0], name=f'{query_id}-left')
-            self._write_fragment_video(query[1], name=f'{query_id}-right')
+            self._write_fragment_video(query[0], name=f"{query_id}-left")
+            self._write_fragment_video(query[1], name=f"{query_id}-right")
             requests.put(
-                self.query_endpoint + query_id,
-                json={"uuid": "{}".format(query_id)}
+                self.query_endpoint + query_id, json={"uuid": "{}".format(query_id)}
             )
 
-        self.pending_queries |= new_queries
+        self.pending_queries = {**self.pending_queries, **new_queries}
 
         gathered_queries = []
         gathered_preferences = []
@@ -959,23 +1415,40 @@ class PrefCollectGatherer(PreferenceGatherer):
 
     def _write_fragment_video(self, fragment, name: str) -> None:
 
-        output_file_name = f'{self.video_output_dir}{name}.webm'
+        output_file_name = f"{self.video_output_dir}{name}.mp4"
         frame_shape = self._get_frame_shape(fragment)
 
-        video_writer = cv2.VideoWriter(
-            output_file_name,
-            cv2.VideoWriter_fourcc(*'VP90'),
-            self.frames_per_second,
-            frame_shape)
+        video_writer = util.FFMPEGVideo(output_file_name, frame_shape)
 
-        for frame in fragment.obs:
-            video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        # make videos from original observations if possible
+        if "original_obs" in fragment.infos[0]:
+            frames = []
+            for i in range(len(fragment.infos)):
+                frames.append(fragment.infos[i]["original_obs"]["pov"])
+                # del fragment.infos[i]["original_obs"]
+        else:
+            # self.logger.log("'original_obs' not in infos dict.")
+            frames = fragment.obs
 
-        video_writer.release()
+        for frame in frames:
+            # transform into RGB array
+            if frame.shape[-1] < 3:
+                missing_channels = 3 - frame.shape[-1]
+                frame = np.concatenate(
+                    [frame] + missing_channels * [frame[..., -1][..., None]], axis=-1
+                )
+
+            video_writer.add_frame(frame)
+
+        video_writer.save(fps=self.frames_per_second)
+        video_writer.to_webm()
 
     @staticmethod
     def _get_frame_shape(fragment) -> Tuple[int, int]:
-        single_frame = np.array(fragment.obs[0])
+        if "original_obs" in fragment.infos[0]:
+            single_frame = np.array(fragment.infos[0]["original_obs"]["pov"])
+        else:
+            single_frame = np.array(fragment.obs[0])
         return single_frame.shape[1], single_frame.shape[0]
 
     def _gather_preference(self, query_id):
@@ -1065,6 +1538,8 @@ class PreferenceDataset(th.utils.data.Dataset):
 def preference_collate_fn(
     batch: Sequence[Tuple[TrajectoryWithRewPair, float]],
 ) -> Tuple[Sequence[TrajectoryWithRewPair], np.ndarray]:
+    # Filter out damaged trajectories
+    batch = list(filter(lambda x: x is not None, batch))
     fragment_pairs, preferences = zip(*batch)
     return list(fragment_pairs), np.array(preferences)
 
@@ -1254,8 +1729,10 @@ class BasicRewardTrainer(RewardTrainer):
         dataloader = self._make_data_loader(dataset)
         epochs = round(self.epochs * epoch_multiplier)
 
-        for _ in tqdm(range(epochs), desc="Training reward model"):
-            for fragment_pairs, preferences in dataloader:
+        for ep in tqdm(range(epochs), desc="Training reward model"):
+            for fragment_pairs, preferences in tqdm(
+                dataloader, desc=f"Training epoch {ep + 1}"
+            ):
                 self.optim.zero_grad()
                 loss = self._training_inner_loop(fragment_pairs, preferences)
                 loss.backward()
@@ -1597,11 +2074,15 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             # (but allows for fragments missing terminal timesteps).
             horizons = (len(traj) for traj in trajectories if traj.terminal)
             self._check_fixed_horizon(horizons)
-            self.logger.log("Creating fragment pairs")
+            self.logger.log(
+                f"Creating fragment pairs from {len(trajectories)} trajectories."
+            )
             fragments = self.fragmenter(trajectories, self.fragment_length, num_pairs)
             with self.logger.accumulate_means("preferences"):
                 self.logger.log("Gathering preferences")
-                gathered_fragments, gathered_preferences = self.preference_gatherer(fragments)
+                gathered_fragments, gathered_preferences = self.preference_gatherer(
+                    fragments,
+                )
             if len(gathered_fragments) > 0:
                 self.dataset.push(gathered_fragments, gathered_preferences)
             self.logger.log(f"Dataset now contains {len(self.dataset)} comparisons")
